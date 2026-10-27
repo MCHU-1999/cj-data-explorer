@@ -1,0 +1,11 @@
+.venv/
+.vscode/
+__pycache__/
+
+
+CiteDescartes/
+Delft/
+QGIS-viz/
+
+
+download_*.py
