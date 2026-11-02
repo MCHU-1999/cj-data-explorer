@@ -5,10 +5,11 @@ __pycache__/
 
 .DS_Store
 
-
+*.laz
 CiteDescartes/
 Delft/
 QGIS-viz/
-Toulouse-cj/
+qgis/
+data/
 
 download_*.py
