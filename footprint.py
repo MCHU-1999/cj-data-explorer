@@ -73,32 +73,43 @@ def stereo_footprint_new(A: np.ndarray, R: np.ndarray, pixels, xyz: np.ndarray, 
     '''
 
     # Image corners (0-based, MicMac convention), last one closes the ring
-    xy1 = np.array([
-        [0, pixels[0], pixels[0], 0, 0],  # x
-        [0, 0, pixels[1], pixels[1], 0],  # y
-        [1, 1, 1, 1, 1]
-    ], dtype=float)
+    uv = np.array([[0, 0], [pixels[0], 0], [pixels[0], pixels[1]], [0, pixels[1]], [0, 0]], float)
+    return pixels_to_ground(A, R, xyz, uv, ground)
+
+
+def pixels_to_ground(A: np.ndarray, R: np.ndarray, xyz: np.ndarray, uv: np.ndarray, ground: float):
+    '''
+    Intersect the rays through pixels uv (N x 2) with the plane Z = ground.
+    A: calibration matrix, R: camera->world rotation, xyz: projection centre.
+    Returns an (N, 3) array.
+    '''
+    uv = np.asarray(uv, float)
+    xy1 = np.vstack((uv.T, np.ones(len(uv))))
 
     # Height from camera center to ground
     height = xyz[2] - ground
 
-    # Pixels to camera-space rays, A is 3x3, rays is 3x5
-    rays = np.linalg.solve(A, xy1)
-    # Camera to world, R maps camera -> world in MicMac
-    rays = R @ rays
+    # Pixels to camera-space rays (3xN), then camera -> world
+    rays = R @ np.linalg.solve(A, xy1)
 
     # Rays must point down towards the ground
     if height <= 0 or np.any(rays[2, :] >= 0):
         raise ValueError("ray does not hit the ground plane; check ground-z / conventions")
 
-    # Extend rays to ground level (scale so that dz = -height)
+    # Extend rays to ground level (scale so that dz = -height), then translate
     rays = rays / rays[2, :] * -height
+    out = rays[0:2, :] + np.asarray(xyz[:2], float).reshape(2, 1)
+    return np.vstack((out, np.full((1, len(uv)), ground))).T
 
-    # Translate
-    footprint = rays[0:2, :] + np.asarray(xyz[:2], float).reshape(2, 1)
-    footprint = np.vstack((footprint, np.full((1, 5), ground))).T
 
-    return footprint
+def world_to_pixels(X, C, R, f, pp):
+    '''Project (N, 3) world points into the image (no distortion).
+    Returns (N, 2) pixels and an (N,) mask of points in front of the camera.'''
+    Xc = (np.asarray(X, float) - C) @ R    # == (R.T @ (X - C).T).T
+    front = Xc[:, 2] > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        uv = pp + f * Xc[:, :2] / Xc[:, 2:3]
+    return uv, front
 
 
 def resolve_calib(file_interne, ori_dir, cache):
