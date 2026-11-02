@@ -6,13 +6,16 @@ as three vector layers in map coordinates:
   wall    visible parts of WallSurfaces   (occlusion handled by rendering)
   ground  GroundSurfaces seen through everything (no occlusion)
 
-Everything is projected through the camera onto the plane Z = ground_z, i.e. the same
-mapping as footprint.py / warp-eo.py, so the layers overlay the warped images in QGIS.
+Each building is projected through the camera onto its own ground plane: Z = mean height
+of the building's LoD2.2 GroundSurfaces. So the ground outline lands at the building's true
+map position, and roofs / walls are displaced from it as the camera sees them (relief
+displacement). Note: warp-eo.py uses one global ground plane, so where a building's ground
+height differs from that plane the warped image and these layers drift apart slightly.
 One feature per building id (MultiPolygon). Output: OUT_DIR/<image>_cj.gpkg
 
 Example:
   python render-cj.py data/Toulouse_cj/573960_6275966.city.json \
-      data/Toulouse_eo/Ori-Compense-Figee5 data/Toulouse_eo/cj --ground-z 146.865955 --limit 1
+      data/Toulouse_eo/Ori-Compense-Figee5 data/Toulouse_eo/cj --limit 1
 """
 import argparse
 import glob
@@ -34,7 +37,7 @@ from scipy import ndimage
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from footprint import (load_external_param, pixels_to_ground, resolve_calib,  # noqa: E402
-                       stereo_footprint_new, world_to_pixels)
+                       world_to_pixels)
 
 # cj-measure.py has a hyphen in its name, so load it by path
 _spec = importlib.util.spec_from_file_location("cj_measure", HERE / "cj-measure.py")
@@ -57,6 +60,21 @@ CODE_STRIDE = 997   # odd -> label <-> colour is a bijection mod 2^24; spreads c
 def building_id(obj):
     """Geometry lives in BuildingParts; group by their parent Building."""
     return obj.parents[0] if obj.parents else obj.id
+
+
+def building_ground_z(tile):
+    """Ground height per building: mean z of the vertices of its LoD2.2 GroundSurfaces
+    (all parts together). Buildings without a GroundSurface use their lowest vertex."""
+    ground, lowest = {}, {}
+    for obj in tile.objects.values():
+        bid = building_id(obj)
+        for surf in obj.surfaces(LOD):
+            z = np.concatenate([r[:, 2] for r in surf.rings])
+            lowest[bid] = min(lowest.get(bid, np.inf), z.min())
+            if surf.semantic == "GroundSurface":
+                ground.setdefault(bid, []).append(z)
+    return {bid: float(np.concatenate(ground[bid]).mean()) if bid in ground else float(z0)
+            for bid, z0 in lowest.items()}
 
 
 def triangulate(rings):
@@ -181,39 +199,53 @@ def merge(polys, clip=None, simplify=0.0):
     return ogr.ForceToMultiPolygon(g)
 
 
-def visible_layers(codes, labels, scale, A, R, C, ground_z, simplify):
-    """Label image -> {layer: {building_id: MultiPolygon}} on the ground plane."""
+def visible_layers(codes, labels, scale, A, R, C, f, ground_z):
+    """Label image -> {layer: {building_id: MultiPolygon}}, each building projected onto
+    its own ground plane Z = ground_z[building_id]."""
     polys = {}
     for geom, code in shapes(codes, mask=codes > 0, connectivity=4,
                              transform=Affine.scale(1 / scale)):   # -> full-res pixel coords
         key = labels.get(int(code))
         if key is not None:
-            polys.setdefault(key, []).append(polygon_to_ground(geom["coordinates"], A, R, C, ground_z))
+            polys.setdefault(key, []).append(
+                polygon_to_ground(geom["coordinates"], A, R, C, ground_z[key[0]]))
     out = {layer: {} for layer in CLASSES.values()}
     for (bid, layer), ps in polys.items():
+        # one render pixel on this building's ground plane: smooths the pixel staircase
+        simplify = (C[2] - ground_z[bid]) / (f * scale)
         g = merge(ps, simplify=simplify)
         if g is not None:
             out[layer][bid] = g
     return out
 
 
-def ground_layer(tile, C, R, f, pp, A, ground_z, clip):
-    """GroundSurfaces projected through the camera onto Z = ground_z (no occlusion)."""
+def ground_layer(tile, C, R, f, pp, A, size, ground_z):
+    """GroundSurfaces as seen through everything (no occlusion), clipped to the image
+    frame in pixel space, then projected onto the building's ground plane."""
+    frame = ogr.Geometry(ogr.wkbPolygon)
+    frame.AddGeometry(ring_to_ogr([(0, 0), (size[0], 0), (size[0], size[1]), (0, size[1])]))
     polys = {}
     for obj in tile.objects.values():
+        bid = building_id(obj)
         for surf in obj.surfaces(LOD, "GroundSurface"):
-            rings_px = []
+            poly_px = ogr.Geometry(ogr.wkbPolygon)
             for ring in surf.rings:
                 uv, front = world_to_pixels(ring, C, R, f, pp)
                 if not front.all():
                     break
-                rings_px.append(uv)
+                poly_px.AddGeometry(ring_to_ogr(uv))
             else:
-                polys.setdefault(building_id(obj), []).append(
-                    polygon_to_ground(rings_px, A, R, C, ground_z))
+                inside = poly_px.Intersection(frame)
+                if inside is None or inside.IsEmpty():
+                    continue
+                for part in ogr.ForceToMultiPolygon(inside):
+                    rings = [np.array(part.GetGeometryRef(i).GetPoints())[:, :2]
+                             for i in range(part.GetGeometryCount())]
+                    polys.setdefault(bid, []).append(
+                        polygon_to_ground(rings, A, R, C, ground_z[bid]))
     out = {}
     for bid, ps in polys.items():
-        g = merge(ps, clip=clip)
+        g = merge(ps)
         if g is not None:
             out[bid] = g
     return out
@@ -248,8 +280,6 @@ def main():
     ap.add_argument("cityjson")
     ap.add_argument("ori_dir", help="e.g. Ori-Compense-Figee5")
     ap.add_argument("out_dir", type=Path)
-    ap.add_argument("--ground-z", type=float, required=True,
-                    help="ground plane height, same as used for footprint.py / warp-eo.py")
     ap.add_argument("--scale", type=float, default=0.25, help="render scale of the full image (default 0.25)")
     ap.add_argument("--images", nargs="+", help="only these image names (e.g. 20FE31100x00028_02285.tif)")
     ap.add_argument("--limit", type=int, help="only process the first N images")
@@ -262,7 +292,9 @@ def main():
     origin = tile.local_origin()
     scene, labels = build_scene(tile, origin)
     scene_verts = next(iter(scene.meshes)).primitives[0].positions
-    print(f"scene: {len(scene_verts)} vertices, {len(labels)} (building, class) labels")
+    ground_z = building_ground_z(tile)
+    print(f"scene: {len(scene_verts)} vertices, {len(labels)} (building, class) labels, "
+          f"ground z {min(ground_z.values()):.2f} .. {max(ground_z.values()):.2f}")
 
     files = sorted(glob.glob(os.path.join(a.ori_dir, "Orientation-*.xml")))
     names = [os.path.basename(p)[len("Orientation-"):-len(".xml")] for p in files]
@@ -277,15 +309,9 @@ def main():
         f, pp, size = resolve_calib(fi, a.ori_dir, cache)
         A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
 
-        # image footprint on the ground plane, to clip the ground layer
-        fp = ogr.Geometry(ogr.wkbPolygon)
-        fp.AddGeometry(ring_to_ogr(stereo_footprint_new(A, R, size, C, a.ground_z)[:, :2]))
-        # one render pixel on the ground: smooths the pixel staircase of the vectorised edges
-        simplify = (C[2] - a.ground_z) / (f * a.scale)
-
         codes = render_labels(scene, labels, C, R, f, pp, size, a.scale, origin, scene_verts)
-        layers = visible_layers(codes, labels, a.scale, A, R, C, a.ground_z, simplify)
-        layers["ground"] = ground_layer(tile, C, R, f, pp, A, a.ground_z, fp)
+        layers = visible_layers(codes, labels, a.scale, A, R, C, f, ground_z)
+        layers["ground"] = ground_layer(tile, C, R, f, pp, A, size, ground_z)
 
         out = a.out_dir / f"{Path(name).stem}_cj.gpkg"
         write_gpkg(str(out), layers, name, srs)

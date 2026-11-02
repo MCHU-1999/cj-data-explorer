@@ -5,7 +5,7 @@ Read MicMac orientations (Ori-XXX/Orientation-*.xml) and export, for QGIS:
   - trajectory.csv  camera centres in flight order, i.e. the plane trajectory (POINT Z)
 
 Usage (run from the folder that contains the images and the Ori- folder):
-  python footprint.py ../Toulouse_overlap/Ori-Compense-Figee5 --ground-z 146.865955
+  python footprint.py ../Toulouse_overlap/Ori-Compense-Figee5 --ground-z 132.65933
 
 Conventions (MicMac default, eConvApero_DistM2C):
   R in <CodageMatr> maps camera -> world:   X_world = R @ X_cam + C
