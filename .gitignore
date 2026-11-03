@@ -11,5 +11,6 @@ Delft/
 QGIS-viz/
 qgis/
 data/
+data_subset/
 
 download_*.py

@@ -181,7 +181,7 @@ def _empty_grid(tile: CityJSON, res: float) -> Raster:
     xmin, ymin = np.floor(tile.vertices[:, :2].min(axis=0) / res) * res
     xmax, ymax = np.ceil(tile.vertices[:, :2].max(axis=0) / res) * res
     shape = (round((ymax - ymin) / res), round((xmax - xmin) / res))
-    return Raster(data=np.full(shape, np.nan, np.float32),
+    return Raster(data=np.full(shape, np.ncj_measurean, np.float32),
                   transform=Affine(res, 0, xmin, 0, -res, ymax), crs=_epsg(tile.crs))
 
 

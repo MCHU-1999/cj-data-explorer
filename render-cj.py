@@ -1,323 +1,100 @@
 #!/usr/bin/env python3
 """
-Render a LoD2.2 CityJSON from each camera and export what the camera sees, per building,
-as three vector layers in map coordinates:
-  roof    visible parts of RoofSurfaces   (occlusion handled by rendering)
-  wall    visible parts of WallSurfaces   (occlusion handled by rendering)
-  ground  GroundSurfaces seen through everything (no occlusion)
+Render the LoD2.2 CityJSON buildings from the camera of one oriented image (MicMac) and
+blend the rendering over that image, to check how well model and image line up.
+Roofs red, walls cyan; only what the camera sees (hidden surfaces are occluded).
+White lines mark where the rendered colour changes (surface / building outlines).
 
-Each building is projected through the camera onto its own ground plane: Z = mean height
-of the building's LoD2.2 GroundSurfaces. So the ground outline lands at the building's true
-map position, and roofs / walls are displaced from it as the camera sees them (relief
-displacement). Note: warp-eo.py uses one global ground plane, so where a building's ground
-height differs from that plane the warped image and these layers drift apart slightly.
-One feature per building id (MultiPolygon). Output: OUT_DIR/<image>_cj.gpkg
-
-Example:
-  python render-cj.py data/Toulouse_cj/573960_6275966.city.json \
-      data/Toulouse_eo/Ori-Compense-Figee5 data/Toulouse_eo/cj --limit 1
+Camera conventions: see footprint.py.
 """
-import argparse
-import glob
-import importlib.util
 import os
-import sys
-from pathlib import Path
+import warnings
 
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")   # headless rendering
 
 import mapbox_earcut as earcut
 import numpy as np
 import pyrender
-from osgeo import ogr, osr
-from rasterio.features import shapes
-from rasterio.transform import Affine
-from scipy import ndimage
+import rasterio
+from PIL import Image
+from rasterio.enums import Resampling
+from rasterio.errors import NotGeoreferencedWarning
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-from footprint import (load_external_param, pixels_to_ground, resolve_calib,  # noqa: E402
-                       world_to_pixels)
+from cj_measure import CityJSON, load_cityjson
+from footprint import BASE_DIR, EXTERNAL_XML, INTERNAL_XML, load_external_param, load_internal_param
 
-# cj-measure.py has a hyphen in its name, so load it by path
-_spec = importlib.util.spec_from_file_location("cj_measure", HERE / "cj-measure.py")
-cj_measure = importlib.util.module_from_spec(_spec)
-sys.modules["cj_measure"] = cj_measure   # dataclasses look the module up while it loads
-_spec.loader.exec_module(cj_measure)
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)   # raw image: no georef
 
-ogr.UseExceptions()
-
+CITYJSON = f"{BASE_DIR}/toulouse.city.json"
+IMAGE = f"{BASE_DIR}/oriented.tif"
+OVERLAY = f"{BASE_DIR}/overlay.jpg"
 LOD = "2.2"
-CLASSES = {"RoofSurface": "roof", "WallSurface": "wall"}   # rendered (with occlusion)
-CODE_STRIDE = 997   # odd -> label <-> colour is a bijection mod 2^24; spreads codes so that
-                    # antialiased edge colours rarely decode to a valid label
-
-
-# --------------------------------------------------------------------------
-# Scene
-# --------------------------------------------------------------------------
-
-def building_id(obj):
-    """Geometry lives in BuildingParts; group by their parent Building."""
-    return obj.parents[0] if obj.parents else obj.id
-
-
-def building_ground_z(tile):
-    """Ground height per building: mean z of the vertices of its LoD2.2 GroundSurfaces
-    (all parts together). Buildings without a GroundSurface use their lowest vertex."""
-    ground, lowest = {}, {}
-    for obj in tile.objects.values():
-        bid = building_id(obj)
-        for surf in obj.surfaces(LOD):
-            z = np.concatenate([r[:, 2] for r in surf.rings])
-            lowest[bid] = min(lowest.get(bid, np.inf), z.min())
-            if surf.semantic == "GroundSurface":
-                ground.setdefault(bid, []).append(z)
-    return {bid: float(np.concatenate(ground[bid]).mean()) if bid in ground else float(z0)
-            for bid, z0 in lowest.items()}
+SCALE = 0.25                                    # render size relative to the full image
+ALPHA = 0.45                                    # opacity of the rendered colours
+COLOURS = {"RoofSurface": (230, 60, 40), "WallSurface": (40, 200, 230)}
 
 
 def triangulate(rings):
-    """Ear-clip one planar surface (exterior + holes). Returns (vertices (n,3), faces (m,3))."""
+    """Ear-clip one planar surface (exterior + holes) -> triangle indices (m, 3)."""
     verts = np.vstack(rings)
     normal = np.linalg.svd(verts - verts.mean(axis=0))[2][-1]
-    drop = int(np.argmax(np.abs(normal)))            # project onto the best-fitting axis plane
-    xy = np.delete(verts, drop, axis=1)
+    xy = np.delete(verts, np.argmax(np.abs(normal)), axis=1)    # flatten on the best axis plane
     ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
-    faces = earcut.triangulate_float64(xy, ends).reshape(-1, 3)
-    return verts, faces
+    return earcut.triangulate_float64(xy, ends).reshape(-1, 3)
 
 
-def build_scene(tile, origin):
-    """One mesh for all roof/wall surfaces. Each (building, class) gets its own flat colour.
-    Returns (pyrender.Scene, labels) with labels[k] = (building_id, layer) for code k."""
-    positions, colours, faces, labels, index = [], [], [], {}, {}
-    n = 0
-    for obj in tile.objects.values():
-        bid = building_id(obj)
-        for surf in obj.surfaces(LOD):
-            layer = CLASSES.get(surf.semantic)
-            if layer is None:
-                continue
-            key = (bid, layer)
-            if key not in index:
-                k = len(index) + 1
-                code = (k * CODE_STRIDE) % (1 << 24)
-                index[key], labels[code] = code, key
-            code = index[key]
-            try:
-                v, f = triangulate(surf.rings)
-            except Exception:
-                continue
-            if len(f) == 0:
-                continue
-            rgb = np.array([code & 255, (code >> 8) & 255, (code >> 16) & 255], np.float32) / 255
-            positions.append(v - origin)
-            colours.append(np.tile(np.append(rgb, 1.0), (len(v), 1)))
-            faces.append(f + n)
-            n += len(v)
-
-    # No custom material: with one, pyrender no longer outputs the vertex colours exactly.
-    # Ring orientation isn't reliable in CityJSON, so draw every triangle in both windings
-    # instead of relying on double-sided materials.
-    faces = np.vstack(faces)
+def building_mesh(tile: CityJSON, origin):
+    """One mesh of all roof and wall surfaces, each vertex coloured by its surface class."""
+    surfs = [s for o in tile.objects.values() for s in o.surfaces(LOD) if s.semantic in COLOURS]
+    verts = [np.vstack(s.rings) - origin for s in surfs]          # local coords: float32-safe
+    starts = np.cumsum([0] + [len(v) for v in verts[:-1]])
+    faces = np.vstack([triangulate(s.rings) + i for s, i in zip(surfs, starts)])
+    colours = np.vstack([np.tile([*COLOURS[s.semantic], 255], (len(v), 1)) for s, v in zip(surfs, verts)])
+    # ring orientation isn't reliable in CityJSON: draw every triangle in both windings
     faces = np.vstack([faces, faces[:, ::-1]])
-    prim = pyrender.Primitive(positions=np.vstack(positions).astype(np.float32),
-                              color_0=np.vstack(colours).astype(np.float32),
-                              indices=faces.astype(np.uint32),
-                              mode=pyrender.constants.GLTF.TRIANGLES)
-    scene = pyrender.Scene(bg_color=[0, 0, 0, 0], ambient_light=[1, 1, 1])
-    scene.add(pyrender.Mesh([prim]))
-    return scene, labels
+    return pyrender.Mesh([pyrender.Primitive(positions=np.vstack(verts).astype(np.float32),
+                                             color_0=(colours / 255).astype(np.float32),
+                                             indices=faces.astype(np.uint32))])
 
 
-# --------------------------------------------------------------------------
-# Rendering
-# --------------------------------------------------------------------------
-
-def render_labels(scene, labels, C, R, f, pp, size, scale, origin, scene_verts):
-    """Render the label image (rows, cols) int32 at `scale` of the full image; 0 = nothing."""
-    w, h = round(size[0] * scale), round(size[1] * scale)
-    dist = np.linalg.norm(scene_verts - (C - origin), axis=1)
-    cam = pyrender.IntrinsicsCamera(fx=f * scale, fy=f * scale, cx=pp[0] * scale, cy=pp[1] * scale,
-                                    znear=max(dist.min() * 0.9, 0.1), zfar=dist.max() * 1.1)
+def render(mesh, C, R, f, pp, size, origin):
+    """Render the mesh from the camera at SCALE -> RGB (h, w, 3) and mask of rendered pixels."""
+    w, h = round(size[0] * SCALE), round(size[1] * SCALE)
+    camera = pyrender.IntrinsicsCamera(f * SCALE, f * SCALE, pp[0] * SCALE, pp[1] * SCALE,
+                                       znear=10, zfar=1e5)
     # MicMac camera: x right, y down, z forward. OpenGL camera: x right, y up, z backward.
     pose = np.eye(4)
-    pose[:3, :3] = R @ np.diag([1.0, -1.0, -1.0])
+    pose[:3, :3] = R @ np.diag([1, -1, -1])
     pose[:3, 3] = C - origin
-    node = scene.add(cam, pose=pose)
-    try:
-        r = pyrender.OffscreenRenderer(w, h)
-        rgb, _ = r.render(scene, flags=pyrender.RenderFlags.FLAT)
-        r.delete()
-    finally:
-        scene.remove_node(node)
-
-    rgb = rgb.astype(np.int64)
-    codes = rgb[..., 0] | (rgb[..., 1] << 8) | (rgb[..., 2] << 16)
-    # Antialiased edges blend colours into codes that don't exist: take the nearest valid pixel
-    valid = (codes == 0) | np.isin(codes, np.fromiter(labels, np.int64))
-    if not valid.all():
-        idx = ndimage.distance_transform_edt(~valid, return_distances=False, return_indices=True)
-        codes = codes[tuple(idx)]
-    return codes.astype(np.int32)
-
-
-# --------------------------------------------------------------------------
-# Vectors
-# --------------------------------------------------------------------------
-
-def ring_to_ogr(points):
-    ring = ogr.Geometry(ogr.wkbLinearRing)
-    for x, y in points:
-        ring.AddPoint_2D(float(x), float(y))
-    ring.CloseRings()
-    return ring
-
-
-def polygon_to_ground(rings_px, A, R, C, ground_z):
-    """List of pixel rings -> OGR polygon on the ground plane."""
-    poly = ogr.Geometry(ogr.wkbPolygon)
-    for ring in rings_px:
-        g = pixels_to_ground(A, R, C, np.asarray(ring, float), ground_z)
-        poly.AddGeometry(ring_to_ogr(g[:, :2]))
-    return poly
-
-
-def merge(polys, clip=None, simplify=0.0):
-    """Union polygons into one MultiPolygon (optionally clipped and simplified)."""
-    mp = ogr.Geometry(ogr.wkbMultiPolygon)
-    for p in polys:
-        mp.AddGeometry(p)
-    g = mp.UnionCascaded()
-    if simplify > 0:
-        g = g.SimplifyPreserveTopology(simplify)
-    if clip is not None:
-        g = g.Intersection(clip)
-    if g is None or g.IsEmpty():
-        return None
-    return ogr.ForceToMultiPolygon(g)
-
-
-def visible_layers(codes, labels, scale, A, R, C, f, ground_z):
-    """Label image -> {layer: {building_id: MultiPolygon}}, each building projected onto
-    its own ground plane Z = ground_z[building_id]."""
-    polys = {}
-    for geom, code in shapes(codes, mask=codes > 0, connectivity=4,
-                             transform=Affine.scale(1 / scale)):   # -> full-res pixel coords
-        key = labels.get(int(code))
-        if key is not None:
-            polys.setdefault(key, []).append(
-                polygon_to_ground(geom["coordinates"], A, R, C, ground_z[key[0]]))
-    out = {layer: {} for layer in CLASSES.values()}
-    for (bid, layer), ps in polys.items():
-        # one render pixel on this building's ground plane: smooths the pixel staircase
-        simplify = (C[2] - ground_z[bid]) / (f * scale)
-        g = merge(ps, simplify=simplify)
-        if g is not None:
-            out[layer][bid] = g
-    return out
-
-
-def ground_layer(tile, C, R, f, pp, A, size, ground_z):
-    """GroundSurfaces as seen through everything (no occlusion), clipped to the image
-    frame in pixel space, then projected onto the building's ground plane."""
-    frame = ogr.Geometry(ogr.wkbPolygon)
-    frame.AddGeometry(ring_to_ogr([(0, 0), (size[0], 0), (size[0], size[1]), (0, size[1])]))
-    polys = {}
-    for obj in tile.objects.values():
-        bid = building_id(obj)
-        for surf in obj.surfaces(LOD, "GroundSurface"):
-            poly_px = ogr.Geometry(ogr.wkbPolygon)
-            for ring in surf.rings:
-                uv, front = world_to_pixels(ring, C, R, f, pp)
-                if not front.all():
-                    break
-                poly_px.AddGeometry(ring_to_ogr(uv))
-            else:
-                inside = poly_px.Intersection(frame)
-                if inside is None or inside.IsEmpty():
-                    continue
-                for part in ogr.ForceToMultiPolygon(inside):
-                    rings = [np.array(part.GetGeometryRef(i).GetPoints())[:, :2]
-                             for i in range(part.GetGeometryCount())]
-                    polys.setdefault(bid, []).append(
-                        polygon_to_ground(rings, A, R, C, ground_z[bid]))
-    out = {}
-    for bid, ps in polys.items():
-        g = merge(ps)
-        if g is not None:
-            out[bid] = g
-    return out
-
-
-def write_gpkg(path, layers, image, srs):
-    drv = ogr.GetDriverByName("GPKG")
-    if os.path.exists(path):
-        drv.DeleteDataSource(path)
-    ds = drv.CreateDataSource(path)
-    for name in ("ground", "wall", "roof"):
-        lyr = ds.CreateLayer(name, srs, ogr.wkbMultiPolygon)
-        lyr.CreateField(ogr.FieldDefn("building_id", ogr.OFTString))
-        lyr.CreateField(ogr.FieldDefn("image", ogr.OFTString))
-        lyr.StartTransaction()
-        for bid, g in layers[name].items():
-            feat = ogr.Feature(lyr.GetLayerDefn())
-            feat.SetField("building_id", bid)
-            feat.SetField("image", image)
-            feat.SetGeometry(g)
-            lyr.CreateFeature(feat)
-        lyr.CommitTransaction()
-    ds = None
-
-
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cityjson")
-    ap.add_argument("ori_dir", help="e.g. Ori-Compense-Figee5")
-    ap.add_argument("out_dir", type=Path)
-    ap.add_argument("--scale", type=float, default=0.25, help="render scale of the full image (default 0.25)")
-    ap.add_argument("--images", nargs="+", help="only these image names (e.g. 20FE31100x00028_02285.tif)")
-    ap.add_argument("--limit", type=int, help="only process the first N images")
-    a = ap.parse_args()
-
-    tile = cj_measure.load_cityjson(a.cityjson)
-    srs = osr.SpatialReference()
-    srs.SetFromUserInput(cj_measure._epsg(tile.crs) or "EPSG:2154")
-    srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    origin = tile.local_origin()
-    scene, labels = build_scene(tile, origin)
-    scene_verts = next(iter(scene.meshes)).primitives[0].positions
-    ground_z = building_ground_z(tile)
-    print(f"scene: {len(scene_verts)} vertices, {len(labels)} (building, class) labels, "
-          f"ground z {min(ground_z.values()):.2f} .. {max(ground_z.values()):.2f}")
-
-    files = sorted(glob.glob(os.path.join(a.ori_dir, "Orientation-*.xml")))
-    names = [os.path.basename(p)[len("Orientation-"):-len(".xml")] for p in files]
-    jobs = [(n, p) for n, p in zip(names, files) if not a.images or n in a.images]
-    if a.limit is not None:
-        jobs = jobs[:a.limit]
-
-    a.out_dir.mkdir(parents=True, exist_ok=True)
-    cache = {}
-    for name, path in jobs:
-        C, R, fi = load_external_param(path)
-        f, pp, size = resolve_calib(fi, a.ori_dir, cache)
-        A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
-
-        codes = render_labels(scene, labels, C, R, f, pp, size, a.scale, origin, scene_verts)
-        layers = visible_layers(codes, labels, a.scale, A, R, C, f, ground_z)
-        layers["ground"] = ground_layer(tile, C, R, f, pp, A, size, ground_z)
-
-        out = a.out_dir / f"{Path(name).stem}_cj.gpkg"
-        write_gpkg(str(out), layers, name, srs)
-        print(f"[ok] {out.name}: roof {len(layers['roof'])}, wall {len(layers['wall'])}, "
-              f"ground {len(layers['ground'])} buildings")
+    scene = pyrender.Scene(bg_color=[0, 0, 0, 0])
+    scene.add(mesh)
+    scene.add(camera, pose=pose)
+    renderer = pyrender.OffscreenRenderer(w, h)
+    rgb, depth = renderer.render(scene, flags=pyrender.RenderFlags.FLAT)
+    renderer.delete()
+    return rgb, depth > 0
 
 
 if __name__ == "__main__":
-    main()
+    f, pp, size = load_internal_param(INTERNAL_XML)
+    C, R = load_external_param(EXTERNAL_XML)
+    tile = load_cityjson(CITYJSON)
+    origin = tile.local_origin()
+
+    rgb, mask = render(building_mesh(tile, origin), C, R, f, pp, size, origin)
+
+    # the photo, downsampled to the render size
+    with rasterio.open(IMAGE) as src:
+        photo = src.read([1, 2, 3], out_shape=(3, *mask.shape), resampling=Resampling.average)
+    out = np.moveaxis(photo, 0, -1).astype(np.float32)
+
+    # blend the rendering over the photo, then draw outlines where the rendered colour changes
+    out[mask] = (1 - ALPHA) * out[mask] + ALPHA * rgb[mask]
+    rgb = rgb.astype(int)
+    edge = np.zeros(mask.shape, bool)
+    edge[1:] |= np.any(rgb[1:] != rgb[:-1], axis=-1)
+    edge[:, 1:] |= np.any(rgb[:, 1:] != rgb[:, :-1], axis=-1)
+    out[edge] = 255
+
+    Image.fromarray(out.astype(np.uint8)).save(OVERLAY, quality=90)
+    print(f"wrote {OVERLAY} ({mask.shape[1]}x{mask.shape[0]}, {mask.mean():.0%} of pixels rendered)")

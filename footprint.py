@@ -1,205 +1,96 @@
 #!/usr/bin/env python3
 """
-Read MicMac orientations (Ori-XXX/Orientation-*.xml) and export, for QGIS:
-  - footprints.csv  approximate image footprints on a flat ground plane (POLYGON)
-  - trajectory.csv  camera centres in flight order, i.e. the plane trajectory (POINT Z)
+Footprint of one oriented aerial image (MicMac) on a flat ground plane, for QGIS:
+  footprint.csv  image footprint (POLYGON, WKT), corners in image order TL, TR, BR, BL
+  centre.csv     camera projection centre (POINT Z, WKT)
 
-Usage (run from the folder that contains the images and the Ori- folder):
-  python footprint.py ../Toulouse_overlap/Ori-Compense-Figee5 --ground-z 132.65933
-
-Conventions (MicMac default, eConvApero_DistM2C):
-  R in <CodageMatr> maps camera -> world:   X_world = R @ X_cam + C
+MicMac conventions (eConvApero_DistM2C):
+  R maps camera -> world:  X_world = R @ X_cam + C
   camera frame: x right, y down (image rows), z towards the scene
-  pixel = PP + F * (Xc[0]/Xc[2], Xc[1]/Xc[2])   (lens distortion ignored here)
+  pixel = PP + F * (Xc[0]/Xc[2], Xc[1]/Xc[2])   (lens distortion ignored)
 """
-import argparse
-import csv
-import glob
 import os
+import urllib.request
 import xml.etree.ElementTree as ET
 
 import numpy as np
+import pyproj
+
+BASE_DIR = "data_subset"
+INTERNAL_XML = f"{BASE_DIR}/internal.xml"
+EXTERNAL_XML = f"{BASE_DIR}/external.xml"
+IMAGE_NAME = "oriented.tif"
+GROUND_Z = 132.65933
+FOOTPRINT_CSV = f"{BASE_DIR}/footprint.csv"
+CENTRE_CSV = f"{BASE_DIR}/centre.csv"
+GEOID_GRID = f"{BASE_DIR}/fr_ign_RAF20.tif"                  # IGN geoid model, downloaded once
+GEOID_URL = "https://cdn.proj.org/fr_ign_RAF20.tif"
 
 
-def _nums(text):
-    return [float(v) for v in text.split()]
-
-
-def _text(root, tag):
-    el = root.find(f".//{tag}")
-    if el is None or el.text is None:
-        raise ValueError(f"<{tag}> not found")
-    return el.text.strip()
+def numbers(root, tag):
+    """Whitespace-separated numbers of the first <tag> in the XML, as an array."""
+    return np.array(root.findtext(f".//{tag}").split(), float)
 
 
 def load_internal_param(path):
-    """Focal length (px), principal point (px), image size (w, h)."""
+    """Focal length F (px), principal point PP (px), image size (w, h)."""
     root = ET.parse(path).getroot()
-    f = float(_text(root, "F"))
-    pp = np.array(_nums(_text(root, "PP")))
-    w, h = (int(v) for v in _nums(_text(root, "SzIm")))
-    return f, pp, (w, h)
+    w, h = numbers(root, "SzIm").astype(int)
+    return numbers(root, "F")[0], numbers(root, "PP"), (w, h)
 
 
 def load_external_param(path):
-    """Projection centre C, rotation R (camera->world), calibration file name."""
+    """Projection centre C and rotation R (camera -> world)."""
     root = ET.parse(path).getroot()
-    ext = root.find(".//Externe")
-    if ext is None:
-        raise ValueError("<Externe> not found")
-    C = np.array(_nums(_text(ext, "Centre")))
-    cm = ext.find(".//CodageMatr")
-    if cm is None:
-        raise ValueError("rotation is not stored as <CodageMatr>")
-    R = np.array([_nums(cm.find(t).text) for t in ("L1", "L2", "L3")])
-    return C, R, _text(root, "FileInterne")
+    R = np.array([numbers(root, "L1"), numbers(root, "L2"), numbers(root, "L3")])
+    C = numbers(root, "Centre")
+    C[2] -= geoid_height(C[0], C[1])                  # ellipsoidal height -> altitude
+    return C, R
 
 
-def world_to_pixel(X, C, R, f, pp):
-    """Project a 3D world point into the image (no distortion)."""
-    Xc = R.T @ (np.asarray(X, float) - C)
-    if Xc[2] <= 0:
-        return None  # point is behind the camera
-    return pp + f * Xc[:2] / Xc[2]
+def geoid_height(x, y):
+    """Geoid height N (m) above the GRS80 ellipsoid at Lambert-93 x, y (RAF20 grid)."""
+    if not os.path.exists(GEOID_GRID):                # first run only, then read locally
+        urllib.request.urlretrieve(GEOID_URL, GEOID_GRID)
+    geoid = pyproj.Transformer.from_pipeline(
+        "+proj=pipeline "
+        "+step +inv +proj=lcc +lat_0=46.5 +lon_0=3 +lat_1=49 +lat_2=44 "
+        "+x_0=700000 +y_0=6600000 +ellps=GRS80 "      # Lambert-93 -> geographic
+        f"+step +proj=vgridshift +grids={os.path.abspath(GEOID_GRID)} +multiplier=1")
+    return geoid.transform(x, y, 0.0)[2]
 
 
-def stereo_footprint_new(A: np.ndarray, R: np.ndarray, pixels, xyz: np.ndarray, ground: float):
-    '''
-    Calculates the full coverage of a stereo image on the ground (the footprint)
-    based on the calibration matrix A, the camera->world rotation R (MicMac
-    <CodageMatr>), the image size in pixels and the projection centre xyz.
-
-    Returns a closed ring of 5 points (x, y, ground), as a 5x3 array.
-    '''
-
-    # Image corners (0-based, MicMac convention), last one closes the ring
-    uv = np.array([[0, 0], [pixels[0], 0], [pixels[0], pixels[1]], [0, pixels[1]], [0, 0]], float)
-    return pixels_to_ground(A, R, xyz, uv, ground)
-
-
-def pixels_to_ground(A: np.ndarray, R: np.ndarray, xyz: np.ndarray, uv: np.ndarray, ground: float):
-    '''
-    Intersect the rays through pixels uv (N x 2) with the plane Z = ground.
-    A: calibration matrix, R: camera->world rotation, xyz: projection centre.
-    Returns an (N, 3) array.
-    '''
-    uv = np.asarray(uv, float)
-    xy1 = np.vstack((uv.T, np.ones(len(uv))))
-
-    # Height from camera center to ground
-    height = xyz[2] - ground
-
-    # Pixels to camera-space rays (3xN), then camera -> world
-    rays = R @ np.linalg.solve(A, xy1)
-
-    # Rays must point down towards the ground
-    if height <= 0 or np.any(rays[2, :] >= 0):
-        raise ValueError("ray does not hit the ground plane; check ground-z / conventions")
-
-    # Extend rays to ground level (scale so that dz = -height), then translate
-    rays = rays / rays[2, :] * -height
-    out = rays[0:2, :] + np.asarray(xyz[:2], float).reshape(2, 1)
-    return np.vstack((out, np.full((1, len(uv)), ground))).T
+def pixels_to_ground(A, R, C, uv, ground):
+    """Intersect the rays through pixels uv (N, 2) with the plane Z = ground -> (N, 3)."""
+    rays = R @ np.linalg.solve(A, np.column_stack([uv, np.ones(len(uv))]).T)   # 3 x N, world
+    if C[2] <= ground or np.any(rays[2] >= 0):
+        raise ValueError("ray does not hit the ground plane; check GROUND_Z / conventions")
+    s = (ground - C[2]) / rays[2]                     # ray length to reach the plane
+    return C + (rays * s).T
 
 
 def world_to_pixels(X, C, R, f, pp):
-    '''Project (N, 3) world points into the image (no distortion).
-    Returns (N, 2) pixels and an (N,) mask of points in front of the camera.'''
-    Xc = (np.asarray(X, float) - C) @ R    # == (R.T @ (X - C).T).T
-    front = Xc[:, 2] > 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        uv = pp + f * Xc[:, :2] / Xc[:, 2:3]
-    return uv, front
-
-
-def resolve_calib(file_interne, ori_dir, cache):
-    candidates = [
-        file_interne,
-        os.path.join(os.path.dirname(os.path.abspath(ori_dir)), file_interne),
-        os.path.join(ori_dir, os.path.basename(file_interne)),
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            if p not in cache:
-                cache[p] = load_internal_param(p)
-            return cache[p]
-    raise FileNotFoundError(f"calibration file not found: {file_interne}")
-
-
-def micmac_footprints(ori_dir, ground_z=0.0, out_dir=None, verbose=True):
-    '''
-    Compute camera centres and ground footprints for every
-    Orientation-*.xml in ori_dir, projected on the plane Z = ground_z.
-
-    Returns (centres, footprints), two dicts keyed by image name:
-      centres[name]    -> (3,) array, projection centre
-      footprints[name] -> (5, 3) array, closed ring on the ground
-    If out_dir is given, also writes footprints.csv and trajectory.csv (WKT) there.
-    '''
-    files = sorted(glob.glob(os.path.join(ori_dir, "Orientation-*.xml")))
-    if not files:
-        raise FileNotFoundError(f"no Orientation-*.xml in {ori_dir}")
-
-    cache, centres, footprints = {}, {}, {}
-    for path in files:
-        name = os.path.basename(path)[len("Orientation-"):-len(".xml")]
-        C, R, fi = load_external_param(path)
-        f, pp, (w, h) = resolve_calib(fi, ori_dir, cache)
-
-        A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
-        ring = stereo_footprint_new(A, R, (w, h), C, ground_z)
-        centres[name], footprints[name] = C, ring
-
-        if verbose:
-            # sanity checks: R orthonormal, corner round-trip
-            ortho_err = np.abs(R.T @ R - np.eye(3)).max()
-            corners = [(0, 0), (w, 0), (w, h), (0, h)]
-            back = [world_to_pixel(g, C, R, f, pp) for g in ring[:4]]
-            rt_err = max(np.abs(np.array(b) - np.array(c)).max() for b, c in zip(back, corners))
-            print(f"{name}: C = ({C[0]:.2f}, {C[1]:.2f}, {C[2]:.2f})  "
-                  f"F = {f:.1f}px  size = {w}x{h}  |RtR-I| = {ortho_err:.1e}  round-trip = {rt_err:.1e}px")
-
-    if out_dir is not None:
-        write_csv(footprints, out_dir)
-        write_trajectory(centres, out_dir)
-        if verbose:
-            print(f"\nwrote {len(files)} images to footprints.csv and trajectory.csv in {out_dir}")
-
-    return centres, footprints
-
-
-def write_csv(footprints, out_dir):
-    '''Write footprints.csv (POLYGON as WKT) for QGIS.'''
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "footprints.csv"), "w", newline="") as fh:
-        wr = csv.writer(fh)
-        wr.writerow(["image", "wkt"])
-        for name, ring in footprints.items():
-            coords = ", ".join(f"{p[0]:.3f} {p[1]:.3f}" for p in ring)
-            wr.writerow([name, f"POLYGON (({coords}))"])
-
-
-def write_trajectory(centres, out_dir):
-    '''Write trajectory.csv: camera centres (POINT Z as WKT) in image-name order,
-    which is the flight order for sequentially numbered images.'''
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "trajectory.csv"), "w", newline="") as fh:
-        wr = csv.writer(fh)
-        wr.writerow(["order", "image", "x", "y", "z", "wkt"])
-        for i, (name, C) in enumerate(sorted(centres.items())):
-            wr.writerow([i, name, f"{C[0]:.3f}", f"{C[1]:.3f}", f"{C[2]:.3f}",
-                         f"POINT Z ({C[0]:.3f} {C[1]:.3f} {C[2]:.3f})"])
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("ori_dir", help="e.g. Ori-Compense-Figee5")
-    parser.add_argument("--ground-z", type=float, default=0.0,
-                    help="mean terrain height, same vertical reference as the orientation")
-    parser.add_argument("--out-dir", default=".")
-    args = parser.parse_args()
-    micmac_footprints(args.ori_dir, args.ground_z, args.out_dir)
+    """Project world points X (N, 3) into the image -> (N, 2) pixels."""
+    Xc = (X - C) @ R                                  # == (R.T @ (X - C).T).T, camera frame
+    return pp + f * Xc[:, :2] / Xc[:, 2:3]
 
 
 if __name__ == "__main__":
-    main()
+    f, pp, (w, h) = load_internal_param(INTERNAL_XML)
+    C, R = load_external_param(EXTERNAL_XML)
+    A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
+
+    # image corners TL, TR, BR, BL, and TL again to close the ring
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h], [0, 0]], float)
+    ring = pixels_to_ground(A, R, C, corners, GROUND_Z)
+
+    # sanity check: the ground corners project back onto the image corners
+    err = np.abs(world_to_pixels(ring, C, R, f, pp) - corners).max()
+    print(f"C = {np.round(C, 2)}  F = {f:.0f}px  size = {w}x{h}  round-trip = {err:.1e}px")
+
+    coords = ", ".join(f"{x:.3f} {y:.3f}" for x, y in ring[:, :2])
+    with open(FOOTPRINT_CSV, "w") as fh:
+        fh.write(f'image,wkt\n{IMAGE_NAME},"POLYGON (({coords}))"\n')
+    with open(CENTRE_CSV, "w") as fh:
+        fh.write(f'image,wkt\n{IMAGE_NAME},"POINT Z ({C[0]:.3f} {C[1]:.3f} {C[2]:.3f})"\n')
+    print(f"wrote {FOOTPRINT_CSV} and {CENTRE_CSV}")
