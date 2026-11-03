@@ -16,11 +16,13 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import pyproj
 
+from cj_measure import load_cityjson
+
 BASE_DIR = "data_subset"
 INTERNAL_XML = f"{BASE_DIR}/internal.xml"
 EXTERNAL_XML = f"{BASE_DIR}/external.xml"
 IMAGE_NAME = "oriented.tif"
-GROUND_Z = 132.65933
+CITYJSON = f"{BASE_DIR}/toulouse.city.json"
 FOOTPRINT_CSV = f"{BASE_DIR}/footprint.csv"
 CENTRE_CSV = f"{BASE_DIR}/centre.csv"
 GEOID_GRID = f"{BASE_DIR}/fr_ign_RAF20.tif"                  # IGN geoid model, downloaded once
@@ -60,11 +62,18 @@ def geoid_height(x, y):
     return geoid.transform(x, y, 0.0)[2]
 
 
+def median_ground(path, lod="2.2"):
+    """Median z of all LoD2.2 building ground surfaces: a guess of the terrain height."""
+    tile = load_cityjson(path)
+    return np.median([r[:, 2].min() for o in tile.objects.values()
+                      for s in o.surfaces(lod, "GroundSurface") for r in s.rings])
+
+
 def pixels_to_ground(A, R, C, uv, ground):
     """Intersect the rays through pixels uv (N, 2) with the plane Z = ground -> (N, 3)."""
     rays = R @ np.linalg.solve(A, np.column_stack([uv, np.ones(len(uv))]).T)   # 3 x N, world
     if C[2] <= ground or np.any(rays[2] >= 0):
-        raise ValueError("ray does not hit the ground plane; check GROUND_Z / conventions")
+        raise ValueError("ray does not hit the ground plane; check ground z / conventions")
     s = (ground - C[2]) / rays[2]                     # ray length to reach the plane
     return C + (rays * s).T
 
@@ -82,11 +91,12 @@ if __name__ == "__main__":
 
     # image corners TL, TR, BR, BL, and TL again to close the ring
     corners = np.array([[0, 0], [w, 0], [w, h], [0, h], [0, 0]], float)
-    ring = pixels_to_ground(A, R, C, corners, GROUND_Z)
+    ground = median_ground(CITYJSON)
+    ring = pixels_to_ground(A, R, C, corners, ground)
 
     # sanity check: the ground corners project back onto the image corners
     err = np.abs(world_to_pixels(ring, C, R, f, pp) - corners).max()
-    print(f"C = {np.round(C, 2)}  F = {f:.0f}px  size = {w}x{h}  round-trip = {err:.1e}px")
+    print(f"C = {np.round(C, 2)}  F = {f:.0f}px  size = {w}x{h}  ground z = {ground:.2f}  round-trip = {err:.1e}px")
 
     coords = ", ".join(f"{x:.3f} {y:.3f}" for x, y in ring[:, :2])
     with open(FOOTPRINT_CSV, "w") as fh:
