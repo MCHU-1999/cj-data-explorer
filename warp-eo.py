@@ -17,7 +17,7 @@ gdal.UseExceptions()
 IMAGE = f"{BASE_DIR}/{IMAGE_NAME}"
 WARPED = f"{BASE_DIR}/oriented_warped.tif"
 EPSG = 2154                                   # Lambert-93
-RES = 0.5                                     # output pixel size (m)
+RES = 0.1                                     # output pixel size (m)
 GRID = 11                                     # GCPs per image side
 
 
