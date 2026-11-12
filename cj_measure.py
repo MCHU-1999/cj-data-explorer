@@ -13,6 +13,8 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.features import rasterize
 from rasterio.transform import Affine
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling, reproject
 
 
 # --------------------------------------------------------------------------
@@ -163,11 +165,46 @@ class Raster:
             dst.write(self.data.astype(np.float32), 1)
 
 
-def load_dsm(path: str | Path) -> Raster:
-    """Read band 1 of a GeoTIFF; nodata becomes NaN."""
+def load_dsm(path: str | Path, like: Raster | None = None,
+             resampling: Resampling = Resampling.average) -> Raster:
+    """Read band 1 of a GeoTIFF; nodata becomes NaN.
+
+    If `like` is given, the raster is warped on the fly onto `like`'s grid (extent,
+    resolution, crs), so only the target window is ever held in memory. For going
+    from fine to coarse use `average` (or `max` to keep roof edges, `med` against noise);
+    nodata pixels are ignored by the aggregation.
+    """
     with rasterio.open(path) as src:
-        data = src.read(1, masked=True).astype(np.float32).filled(np.nan)
-        return Raster(data=data, transform=src.transform, crs=src.crs)
+        if like is None:
+            data = src.read(1, masked=True).astype(np.float32).filled(np.nan)
+            return Raster(data=data, transform=src.transform, crs=src.crs)
+        # If `like` has no crs, or one equivalent to the source's, keep the source crs.
+        # This avoids a needless (and sometimes failing) datum lookup between two
+        # WKT spellings of the same CRS.
+        dst_crs = src.crs if like.crs is None or CRS.from_user_input(like.crs) == src.crs \
+            else CRS.from_user_input(like.crs)
+        with WarpedVRT(src, crs=dst_crs, transform=like.transform,
+                       width=like.shape[1], height=like.shape[0],
+                       resampling=resampling, src_nodata=src.nodata, nodata=np.nan) as vrt:
+            data = vrt.read(1, masked=True).astype(np.float32).filled(np.nan)
+        return Raster(data=data, transform=like.transform, crs=dst_crs)
+
+
+def geoid_undulation(geoid_path: str | Path, like: Raster) -> Raster:
+    """Geoid grid (e.g. IGN RAF20, N in metres) bilinearly sampled on `like`'s grid."""
+    n = np.full(like.shape, np.nan, np.float32)
+    with rasterio.open(geoid_path) as src:
+        reproject(rasterio.band(src, 1), n, dst_transform=like.transform,
+                  dst_crs=like.crs, resampling=Resampling.bilinear, dst_nodata=np.nan)
+    return Raster(data=n, transform=like.transform, crs=like.crs)
+
+
+def ellipsoidal_to_altitude(dsm: Raster, geoid_path: str | Path) -> Raster:
+    """Ellipsoidal heights h -> altitudes H = h - N (RAF20: NGF-IGN69, EPSG:5720)."""
+    n = geoid_undulation(geoid_path, dsm)
+    if np.isnan(n.data).any():
+        raise ValueError("Geoid grid does not cover the whole DSM")
+    return Raster(data=dsm.data - n.data, transform=dsm.transform, crs=dsm.crs)
 
 
 def _epsg(crs: str | None) -> str | None:
@@ -181,19 +218,25 @@ def _empty_grid(tile: CityJSON, res: float) -> Raster:
     xmin, ymin = np.floor(tile.vertices[:, :2].min(axis=0) / res) * res
     xmax, ymax = np.ceil(tile.vertices[:, :2].max(axis=0) / res) * res
     shape = (round((ymax - ymin) / res), round((xmax - xmin) / res))
-    return Raster(data=np.full(shape, np.ncj_measurean, np.float32),
+    return Raster(data=np.full(shape, np.nan, np.float32),
                   transform=Affine(res, 0, xmin, 0, -res, ymax), crs=_epsg(tile.crs))
 
 
 def cityjson_to_dsm(tile: CityJSON, like: Raster | None = None, res: float = 0.5,
-                    lod: str = "2.2", semantic: str = "RoofSurface") -> Raster:
+                    lod: str = "2.2", semantic: str = "RoofSurface",
+                    keep_like: bool = False) -> Raster:
     """Burn the roof surfaces of a CityJSON into a DSM.
 
     Each roof surface is planar, so its height at a pixel centre is taken from the
     plane fitted through its exterior ring. Where surfaces overlap the highest wins.
     If `like` is given, its grid (transform, shape, crs) is used so the result can be
     diffed pixel by pixel; otherwise a grid of size `res` covering the tile is made.
+    If `keep_like` is True (requires `like`), pixels not covered by any surface keep
+    `like`'s values; covered pixels are always overwritten by the CityJSON, even
+    where `like` is higher. Otherwise they are NaN.
     """
+    if keep_like and like is None:
+        raise ValueError("keep_like=True requires `like`")
     if like is not None:
         out = Raster(np.full(like.shape, np.nan, np.float32), like.transform, like.crs)
     else:
@@ -250,6 +293,12 @@ def cityjson_to_dsm(tile: CityJSON, like: Raster | None = None, res: float = 0.5
             window = out.data[row0:row1, col0:col1]
             window[mask] = np.fmax(window[mask], z[mask])
 
+    if keep_like and like is not None:
+        # Filled after burning (not used as the starting grid) so that fmax above
+        # compares roofs only with each other, never with `like`'s values.
+        uncovered = np.isnan(out.data)
+        out.data[uncovered] = like.data[uncovered]
+
     return out
 
 
@@ -270,6 +319,38 @@ def diff_dsm(a: Raster, b: Raster, fill: float | None = 0.0) -> Raster:
     return Raster(data=data, transform=a.transform, crs=a.crs)
 
 
+def clip_to_valid(r: Raster, mask: Raster, crop: bool = False) -> Raster:
+    """Keep `r` only where `mask` has valid (finite) data; everything else becomes NaN.
+
+    If `mask` is on a different grid it is warped onto `r`'s grid first (nearest
+    neighbour, so the valid footprint isn't smeared). With `crop=True` the result is
+    also trimmed to the bounding box of the pixels that remain valid.
+    """
+    if mask.shape == r.shape and mask.transform.almost_equals(r.transform):
+        valid = np.isfinite(mask.data)
+    else:
+        m = np.full(r.shape, np.nan, np.float32)
+        reproject(mask.data.astype(np.float32), m,
+                  src_transform=mask.transform, src_crs=mask.crs, src_nodata=np.nan,
+                  dst_transform=r.transform, dst_crs=r.crs, dst_nodata=np.nan,
+                  resampling=Resampling.nearest)
+        valid = np.isfinite(m)
+
+    data = np.where(valid, r.data, np.nan).astype(np.float32)
+    transform = r.transform
+
+    if crop:
+        valid &= np.isfinite(data)
+        if not valid.any():
+            raise ValueError("No valid pixels left after clipping")
+        rows, cols = np.where(valid.any(axis=1))[0], np.where(valid.any(axis=0))[0]
+        r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+        data = data[r0:r1, c0:c1]
+        transform = r.transform * Affine.translation(c0, r0)
+
+    return Raster(data=data, transform=transform, crs=r.crs)
+
+
 def diff_stats(d: Raster) -> dict[str, float]:
     v = d.data[np.isfinite(d.data)]
     return {"pixels": int(v.size), "mean": float(v.mean()), "median": float(np.median(v)),
@@ -283,21 +364,28 @@ def diff_stats(d: Raster) -> dict[str, float]:
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
 
-    CITYJSON_PATH = "Delft/Delft-v20250903.city.json"
-    DSM_PATH = "Delft/DSM/AHN5_DSM.tif"
-    CJ_DSM_PATH = "Delft/CJ-DSM.tif"
-    DIFF_PATH = "Delft/CJ-DSM-diff.tif"
+    CITYJSON_PATH = Path("data_t0/toulouse.city.json")
+    DSM_T0 = Path("data_t0/DSM.tif")
+    DSM_T1 = Path("data_t1/DSM-cropped.tif")
+    DSM_DIFF = Path("data_diff/DSM-CJ-diff.tif")
+    DSM_CJ = Path("data_t0/DSM-cityjson.tif")
+    GEOID = Path("data_t0/fr_ign_RAF20.tif")
 
-    tile = load_cityjson(CITYJSON_PATH)
-    print(f"Loaded file {CITYJSON_PATH}")
-    print(f"  - {len(tile.objects)} city objects, {len(tile.vertices)} vertices")
 
-    dsm = load_dsm(DSM_PATH)
-    print(f"Loaded file {DSM_PATH}")
-    print(f"  - CRS: {dsm.crs}")
+    # tile = load_cityjson(CITYJSON_PATH)
+    # print(f"Loaded file {CITYJSON_PATH}")
+    # print(f"  - {len(tile.objects)} city objects, {len(tile.vertices)} vertices")
 
-    cj_dsm = cityjson_to_dsm(tile, like=dsm, res=0.5, lod="2.2", semantic="RoofSurface")
-    cj_dsm.save(CJ_DSM_PATH)
+    dsm_1 = load_dsm(DSM_T1)
+    print(f"Loaded file {DSM_T1}")
+    print(f"  - CRS: {dsm_1.crs}")
 
-    diff = diff_dsm(cj_dsm, dsm, fill=0)
-    diff.save(DIFF_PATH)
+    dsm_0 = load_dsm(DSM_T0, like=dsm_1, resampling=Resampling.average)
+    print(f"Loaded file {DSM_T0}")
+    print(f"  - CRS: {dsm_0.crs}")
+
+    # cj_dsm = cityjson_to_dsm(tile, like=dsm_0, res=0.1, lod="2.2", semantic="RoofSurface", keep_like=True)
+    # cj_dsm.save(DSM_CJ)
+
+    # diff = diff_dsm(dsm_1, dsm_0, fill=None)
+    # diff.save(DSM_DIFF)

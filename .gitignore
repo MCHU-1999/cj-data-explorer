@@ -11,6 +11,10 @@ Delft/
 QGIS-viz/
 qgis/
 data/
-data_subset/
+data_t0/
+data_t1/
+data_t1_test/
+data_diff/
+
 
 download_*.py

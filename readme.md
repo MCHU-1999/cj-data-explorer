@@ -12,9 +12,3 @@ This is for my PhD project's first step: to play with and explore data of differ
 - AHN5 in Delft region is captured in 2023
 - AHN6 in Delft region is captured in 2026
 
-
-[84501.546598713728599,446983.468967006658204, 0]
-[85088.3828125, 446394.25, 43.25]
-
-85088.3828125 - 84501.546598713728599 = 586.8362137863
-446983.468967006658204 - 446394.25 = 589.2189670067

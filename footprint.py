@@ -9,6 +9,8 @@ MicMac conventions (eConvApero_DistM2C):
   camera frame: x right, y down (image rows), z towards the scene
   pixel = PP + F * (Xc[0]/Xc[2], Xc[1]/Xc[2])   (lens distortion ignored)
 """
+import argparse
+import glob
 import os
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -18,15 +20,25 @@ import pyproj
 
 from cj_measure import load_cityjson
 
-BASE_DIR = "data_subset"
-INTERNAL_XML = f"{BASE_DIR}/internal.xml"
-EXTERNAL_XML = f"{BASE_DIR}/external.xml"
-IMAGE_NAME = "oriented.tif"
-CITYJSON = f"{BASE_DIR}/toulouse.city.json"
-FOOTPRINT_CSV = f"{BASE_DIR}/footprint.csv"
-CENTRE_CSV = f"{BASE_DIR}/centre.csv"
-GEOID_GRID = f"{BASE_DIR}/fr_ign_RAF20.tif"                  # IGN geoid model, downloaded once
+# Base data at t = T0
+T0_DIR = "data_t0"
 GEOID_URL = "https://cdn.proj.org/fr_ign_RAF20.tif"
+GEOID_GRID = f"{T0_DIR}/fr_ign_RAF20.tif"
+CITYJSON = f"{T0_DIR}/toulouse.city.json"
+
+# This is just default values
+T1_INPUT_DIR = "/home/MCHu/Documents/projects/Toulouse_EO"
+T1_INTERNAL = f"{T1_INPUT_DIR}/Ori-Compense-Figee5/AutoCal_Foc-123900_Cam-UCE.xml"
+T1_EXTERNAL = f"{T1_INPUT_DIR}/Ori-Compense-Figee5"
+T1_OUTPUT_DIR = "data_t1"
+
+# These are test case paths
+TEST_T1_DIR = "data_t1_test"
+INTERNAL_XML = f"{TEST_T1_DIR}/internal.xml"
+EXTERNAL_XML = f"{TEST_T1_DIR}/external.xml"
+IMAGE = f"{TEST_T1_DIR}/oriented.tif"
+FOOTPRINT_CSV = f"{TEST_T1_DIR}/footprint.csv"
+CENTRE_CSV = f"{TEST_T1_DIR}/centre.csv"
 
 
 def numbers(root, tag):
@@ -84,23 +96,87 @@ def world_to_pixels(X, C, R, f, pp):
     return pp + f * Xc[:, :2] / Xc[:, 2:3]
 
 
-if __name__ == "__main__":
-    f, pp, (w, h) = load_internal_param(INTERNAL_XML)
-    C, R = load_external_param(EXTERNAL_XML)
-    A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
+def image_name(external_xml):
+    """MicMac 'Orientation-<image>.xml' -> '<image>'."""
+    name = os.path.basename(external_xml)
+    name = name.removeprefix("Orientation-")
+    return name.removesuffix(".xml")
 
+
+def expand_externals(paths):
+    """Files are kept as is; a directory expands to its Orientation-*.xml files."""
+    out = []
+    for p in map(os.path.expanduser, paths):
+        if os.path.isdir(p):
+            out += sorted(glob.glob(os.path.join(p, "Orientation-*.xml")))
+        else:
+            out.append(p)
+    if not out:
+        raise SystemExit(f"no external orientation files found in {paths}")
+    return out
+
+
+def footprints(internal_xml, external_xmls, footprint_csv, centre_csv, names=None):
+    """One footprint polygon and one centre point per external file, all sharing one camera."""
+    f, pp, (w, h) = load_internal_param(os.path.expanduser(internal_xml))
+    A = np.array([[f, 0, pp[0]], [0, f, pp[1]], [0, 0, 1]])
     # image corners TL, TR, BR, BL, and TL again to close the ring
     corners = np.array([[0, 0], [w, 0], [w, h], [0, h], [0, 0]], float)
     ground = median_ground(CITYJSON)
-    ring = pixels_to_ground(A, R, C, corners, ground)
+    print(f"F = {f:.0f}px  size = {w}x{h}  ground z = {ground:.2f}  images = {len(external_xmls)}")
 
-    # sanity check: the ground corners project back onto the image corners
-    err = np.abs(world_to_pixels(ring, C, R, f, pp) - corners).max()
-    print(f"C = {np.round(C, 2)}  F = {f:.0f}px  size = {w}x{h}  ground z = {ground:.2f}  round-trip = {err:.1e}px")
+    names = names or [image_name(p) for p in external_xmls]
+    poly_rows, centre_rows = [], []
+    for name, external_xml in zip(names, external_xmls):
+        C, R = load_external_param(external_xml)
+        ring = pixels_to_ground(A, R, C, corners, ground)
 
-    coords = ", ".join(f"{x:.3f} {y:.3f}" for x, y in ring[:, :2])
-    with open(FOOTPRINT_CSV, "w") as fh:
-        fh.write(f'image,wkt\n{IMAGE_NAME},"POLYGON (({coords}))"\n')
-    with open(CENTRE_CSV, "w") as fh:
-        fh.write(f'image,wkt\n{IMAGE_NAME},"POINT Z ({C[0]:.3f} {C[1]:.3f} {C[2]:.3f})"\n')
-    print(f"wrote {FOOTPRINT_CSV} and {CENTRE_CSV}")
+        # sanity check: the ground corners project back onto the image corners
+        err = np.abs(world_to_pixels(ring, C, R, f, pp) - corners).max()
+        print(f"  {name}  C = {np.round(C, 2)}  round-trip = {err:.1e}px")
+
+        coords = ", ".join(f"{x:.3f} {y:.3f}" for x, y in ring[:, :2])
+        poly_rows.append(f'{name},"POLYGON (({coords}))"\n')
+        centre_rows.append(f'{name},"POINT Z ({C[0]:.3f} {C[1]:.3f} {C[2]:.3f})"\n')
+
+    for path, rows in ((footprint_csv, poly_rows), (centre_csv, centre_rows)):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("image,wkt\n" + "".join(rows))
+    print(f"wrote {footprint_csv} and {centre_csv}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "externals", nargs="*",
+        help=f"external orientation XMLs, or directories holding Orientation-*.xml (default: {T1_EXTERNAL})",
+        default=[T1_EXTERNAL]
+    )
+    parser.add_argument(
+        "-i", "--internal", 
+        help=f"internal calibration XML shared by all images (default: {T1_INTERNAL})",
+        default=T1_INTERNAL
+    )
+    parser.add_argument(
+        "-o", "--output-dir", 
+        help=f"where footprint.csv and centre.csv go (default: {T1_OUTPUT_DIR})",
+        default=T1_OUTPUT_DIR
+    )
+    parser.add_argument(
+        "--test", action="store_true", 
+        help=f"run the single-image test case in {TEST_T1_DIR}/ (ignores other args)"
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        footprints(INTERNAL_XML, [EXTERNAL_XML], FOOTPRINT_CSV, CENTRE_CSV, names=[os.path.basename(IMAGE)])
+        return
+    else: 
+        footprints(args.internal, expand_externals(args.externals),
+                os.path.join(args.output_dir, "footprint.csv"),
+                os.path.join(args.output_dir, "centre.csv"))
+
+
+if __name__ == "__main__":
+    main()

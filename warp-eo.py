@@ -9,13 +9,13 @@ The ground lines up; anything with height (roofs, trees) is shifted by relief di
 import numpy as np
 from osgeo import gdal
 
-from footprint import (BASE_DIR, CITYJSON, EXTERNAL_XML, IMAGE_NAME, INTERNAL_XML,
+from footprint import (TEST_T1_DIR, CITYJSON, EXTERNAL_XML, IMAGE, INTERNAL_XML,
                        load_external_param, load_internal_param, median_ground, pixels_to_ground)
 
 gdal.UseExceptions()
 
-IMAGE = f"{BASE_DIR}/{IMAGE_NAME}"
-WARPED = f"{BASE_DIR}/oriented_warped.tif"
+IMAGE = f"{TEST_T1_DIR}/{IMAGE}"
+WARPED = f"{TEST_T1_DIR}/oriented_warped.tif"
 EPSG = 2154                                   # Lambert-93
 RES = 0.1                                     # output pixel size (m)
 GRID = 11                                     # GCPs per image side

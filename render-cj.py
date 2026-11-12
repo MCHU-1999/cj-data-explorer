@@ -14,12 +14,12 @@ import numpy as np
 from osgeo import ogr, osr
 
 from cj_measure import CityJSON, load_cityjson
-from footprint import (BASE_DIR, CITYJSON, EXTERNAL_XML, INTERNAL_XML, load_external_param,
+from footprint import (TEST_T1_DIR, CITYJSON, EXTERNAL_XML, INTERNAL_XML, load_external_param,
                        load_internal_param, median_ground, pixels_to_ground, world_to_pixels)
 
 ogr.UseExceptions()
 
-PROJECTED_GPKG = f"{BASE_DIR}/projected.gpkg"
+PROJECTED_GPKG = f"{TEST_T1_DIR}/projected.gpkg"
 EPSG = 2154                                     # Lambert-93
 LOD = "2.2"
 LAYERS = {"RoofSurface": "roof", "GroundSurface": "ground"}
