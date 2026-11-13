@@ -14,7 +14,8 @@ from rasterio.crs import CRS
 from rasterio.features import rasterize
 from rasterio.transform import Affine
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import Resampling, reproject
+from rasterio.warp import Resampling, reproject, transform_bounds
+from rasterio.windows import Window, from_bounds
 
 
 # --------------------------------------------------------------------------
@@ -61,6 +62,15 @@ class CityJSON:
     objects: dict[str, CityObject]
     vertices: np.ndarray            # (n, 3) float64, real-world coords (transform applied)
     crs: str | None                 # as given in metadata.referenceSystem
+    extent: tuple[float, ...] | None = None  # metadata.geographicalExtent (minx, miny, minz, maxx, maxy, maxz)
+
+    def bounds(self) -> tuple[float, float, float, float]:
+        """2D (xmin, ymin, xmax, ymax): metadata extent if present, else from the vertices."""
+        if self.extent is not None:
+            xmin, ymin, _, xmax, ymax, _ = self.extent
+            return xmin, ymin, xmax, ymax
+        (xmin, ymin), (xmax, ymax) = self.vertices[:, :2].min(axis=0), self.vertices[:, :2].max(axis=0)
+        return float(xmin), float(ymin), float(xmax), float(ymax)
 
     def buildings(self) -> list[CityObject]:
         return [o for o in self.objects.values() if o.type == "Building"]
@@ -140,8 +150,10 @@ def load_cityjson(path: str | Path) -> CityJSON:
             geometries=geoms,
         )
 
-    crs = cj.get("metadata", {}).get("referenceSystem")
-    return CityJSON(path=path, objects=objects, vertices=verts, crs=crs)
+    meta = cj.get("metadata", {})
+    extent = meta.get("geographicalExtent")
+    return CityJSON(path=path, objects=objects, vertices=verts, crs=meta.get("referenceSystem"),
+                    extent=tuple(extent) if extent else None)
 
 
 # --------------------------------------------------------------------------
@@ -319,36 +331,42 @@ def diff_dsm(a: Raster, b: Raster, fill: float | None = 0.0) -> Raster:
     return Raster(data=data, transform=a.transform, crs=a.crs)
 
 
-def clip_to_valid(r: Raster, mask: Raster, crop: bool = False) -> Raster:
-    """Keep `r` only where `mask` has valid (finite) data; everything else becomes NaN.
 
-    If `mask` is on a different grid it is warped onto `r`'s grid first (nearest
-    neighbour, so the valid footprint isn't smeared). With `crop=True` the result is
-    also trimmed to the bounding box of the pixels that remain valid.
+def clip_to_bounds(src_path: str | Path, dst_path: str | Path,
+                   bounds: tuple[float, float, float, float], bounds_crs: CRS | str | None = None,
+                   pad: float = 0.0) -> None:
+    """Crop a GeoTIFF on disk to (xmin, ymin, xmax, ymax), e.g. `tile.bounds()`.
+
+    Only the pixels inside the window are read; all bands, the dtype, nodata and
+    colour interpretation are kept as they are (works for RGB orthophotos too). The
+    window is snapped outward to whole pixels, so the source grid is not resampled.
+    If `bounds_crs` differs from the raster's CRS the bounds are reprojected first.
     """
-    if mask.shape == r.shape and mask.transform.almost_equals(r.transform):
-        valid = np.isfinite(mask.data)
-    else:
-        m = np.full(r.shape, np.nan, np.float32)
-        reproject(mask.data.astype(np.float32), m,
-                  src_transform=mask.transform, src_crs=mask.crs, src_nodata=np.nan,
-                  dst_transform=r.transform, dst_crs=r.crs, dst_nodata=np.nan,
-                  resampling=Resampling.nearest)
-        valid = np.isfinite(m)
+    with rasterio.open(src_path) as src:
+        if bounds_crs is not None and CRS.from_user_input(_epsg(str(bounds_crs))) != src.crs:
+            bounds = transform_bounds(CRS.from_user_input(_epsg(str(bounds_crs))), src.crs, *bounds)
+        xmin, ymin, xmax, ymax = bounds
+        win = from_bounds(xmin - pad, ymin - pad, xmax + pad, ymax + pad, src.transform)
+        c0, r0 = max(int(np.floor(win.col_off)), 0), max(int(np.floor(win.row_off)), 0)
+        c1 = min(int(np.ceil(win.col_off + win.width)), src.width)
+        r1 = min(int(np.ceil(win.row_off + win.height)), src.height)
+        if c0 >= c1 or r0 >= r1:
+            raise ValueError("Bounds do not overlap the raster")
+        win = Window(c0, r0, c1 - c0, r1 - r0)
 
-    data = np.where(valid, r.data, np.nan).astype(np.float32)
-    transform = r.transform
-
-    if crop:
-        valid &= np.isfinite(data)
-        if not valid.any():
-            raise ValueError("No valid pixels left after clipping")
-        rows, cols = np.where(valid.any(axis=1))[0], np.where(valid.any(axis=0))[0]
-        r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-        data = data[r0:r1, c0:c1]
-        transform = r.transform * Affine.translation(c0, r0)
-
-    return Raster(data=data, transform=transform, crs=r.crs)
+        profile = src.profile | {
+            "driver": "GTiff", "width": win.width, "height": win.height,
+            "transform": src.window_transform(win),
+            "tiled": True, "blockxsize": 512, "blockysize": 512,
+            "compress": "DEFLATE", "BIGTIFF": "IF_SAFER",
+        }
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            dst.colorinterp = src.colorinterp
+            # Copy block by block so memory stays bounded however large the crop is.
+            for _, block in dst.block_windows(1):
+                src_block = Window(win.col_off + block.col_off, win.row_off + block.row_off,
+                                   block.width, block.height)
+                dst.write(src.read(window=src_block), window=block)
 
 
 def diff_stats(d: Raster) -> dict[str, float]:
@@ -367,22 +385,25 @@ if __name__ == "__main__":
     CITYJSON_PATH = Path("data_t0/toulouse.city.json")
     DSM_T0 = Path("data_t0/DSM.tif")
     DSM_T1 = Path("data_t1/DSM-cropped.tif")
-    DSM_DIFF = Path("data_diff/DSM-CJ-diff.tif")
+    DSM_DIFF = Path("data_diff/DSM-diff.tif")
     DSM_CJ = Path("data_t0/DSM-cityjson.tif")
+    ORTHO_T1 = Path("/home/MCHu//Documents/projects/Toulouse_EO/results/Ortho.tif")
     GEOID = Path("data_t0/fr_ign_RAF20.tif")
 
 
-    # tile = load_cityjson(CITYJSON_PATH)
-    # print(f"Loaded file {CITYJSON_PATH}")
-    # print(f"  - {len(tile.objects)} city objects, {len(tile.vertices)} vertices")
+    tile = load_cityjson(CITYJSON_PATH)
+    print(f"Loaded file {CITYJSON_PATH}")
+    print(f"  - {len(tile.objects)} city objects, {len(tile.vertices)} vertices")
 
-    dsm_1 = load_dsm(DSM_T1)
-    print(f"Loaded file {DSM_T1}")
-    print(f"  - CRS: {dsm_1.crs}")
+    # dsm_1 = load_dsm(DSM_T1)
+    # print(f"Loaded file {DSM_T1}")
+    # print(f"  - CRS: {dsm_1.crs}")
 
-    dsm_0 = load_dsm(DSM_T0, like=dsm_1, resampling=Resampling.average)
-    print(f"Loaded file {DSM_T0}")
-    print(f"  - CRS: {dsm_0.crs}")
+    # dsm_0 = load_dsm(DSM_T0, like=dsm_1, resampling=Resampling.average)
+    # print(f"Loaded file {DSM_T0}")
+    # print(f"  - CRS: {dsm_0.crs}")
+
+    clip_to_bounds(ORTHO_T1, "data_t1/Ortho-cropped.tif", tile.bounds(), bounds_crs=tile.crs, pad=0.5)
 
     # cj_dsm = cityjson_to_dsm(tile, like=dsm_0, res=0.1, lod="2.2", semantic="RoofSurface", keep_like=True)
     # cj_dsm.save(DSM_CJ)
