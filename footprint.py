@@ -4,74 +4,18 @@ Footprint of one oriented aerial image (MicMac) on a flat ground plane, for QGIS
   footprint.csv  image footprint (POLYGON, WKT), corners in image order TL, TR, BR, BL
   centre.csv     camera projection centre (POINT Z, WKT)
 
-MicMac conventions (eConvApero_DistM2C):
-  R maps camera -> world:  X_world = R @ X_cam + C
-  camera frame: x right, y down (image rows), z towards the scene
-  pixel = PP + F * (Xc[0]/Xc[2], Xc[1]/Xc[2])   (lens distortion ignored)
+Camera conventions: see camera.py.
 """
 import argparse
-import glob
 import os
-import urllib.request
-import xml.etree.ElementTree as ET
 
 import numpy as np
-import pyproj
 
+from camera import (CENTRE_CSV, CITYJSON, EXTERNAL_XML, FOOTPRINT_CSV, IMAGE, INTERNAL_XML,
+                    T1_EXTERNAL, T1_INTERNAL, T1_OUTPUT_DIR, TEST_T1_DIR, expand_externals,
+                    image_name, load_external_param, load_internal_param, pixels_to_ground,
+                    world_to_pixels)
 from cj_measure import load_cityjson
-
-# Base data at t = T0
-T0_DIR = "data_t0"
-GEOID_URL = "https://cdn.proj.org/fr_ign_RAF20.tif"
-GEOID_GRID = f"{T0_DIR}/fr_ign_RAF20.tif"
-CITYJSON = f"{T0_DIR}/toulouse.city.json"
-
-# This is just default values
-T1_INPUT_DIR = "/home/MCHu/Documents/projects/Toulouse_EO"
-T1_INTERNAL = f"{T1_INPUT_DIR}/Ori-Compense-Figee5/AutoCal_Foc-123900_Cam-UCE.xml"
-T1_EXTERNAL = f"{T1_INPUT_DIR}/Ori-Compense-Figee5"
-T1_OUTPUT_DIR = "data_t1"
-
-# These are test case paths
-TEST_T1_DIR = "data_t1_test"
-INTERNAL_XML = f"{TEST_T1_DIR}/internal.xml"
-EXTERNAL_XML = f"{TEST_T1_DIR}/external.xml"
-IMAGE = f"{TEST_T1_DIR}/oriented.tif"
-FOOTPRINT_CSV = f"{TEST_T1_DIR}/footprint.csv"
-CENTRE_CSV = f"{TEST_T1_DIR}/centre.csv"
-
-
-def numbers(root, tag):
-    """Whitespace-separated numbers of the first <tag> in the XML, as an array."""
-    return np.array(root.findtext(f".//{tag}").split(), float)
-
-
-def load_internal_param(path):
-    """Focal length F (px), principal point PP (px), image size (w, h)."""
-    root = ET.parse(path).getroot()
-    w, h = numbers(root, "SzIm").astype(int)
-    return numbers(root, "F")[0], numbers(root, "PP"), (w, h)
-
-
-def load_external_param(path):
-    """Projection centre C and rotation R (camera -> world)."""
-    root = ET.parse(path).getroot()
-    R = np.array([numbers(root, "L1"), numbers(root, "L2"), numbers(root, "L3")])
-    C = numbers(root, "Centre")
-    C[2] -= geoid_height(C[0], C[1])                  # ellipsoidal height -> altitude
-    return C, R
-
-
-def geoid_height(x, y):
-    """Geoid height N (m) above the GRS80 ellipsoid at Lambert-93 x, y (RAF20 grid)."""
-    if not os.path.exists(GEOID_GRID):                # first run only, then read locally
-        urllib.request.urlretrieve(GEOID_URL, GEOID_GRID)
-    geoid = pyproj.Transformer.from_pipeline(
-        "+proj=pipeline "
-        "+step +inv +proj=lcc +lat_0=46.5 +lon_0=3 +lat_1=49 +lat_2=44 "
-        "+x_0=700000 +y_0=6600000 +ellps=GRS80 "      # Lambert-93 -> geographic
-        f"+step +proj=vgridshift +grids={os.path.abspath(GEOID_GRID)} +multiplier=1")
-    return geoid.transform(x, y, 0.0)[2]
 
 
 def median_ground(path, lod="2.2"):
@@ -79,41 +23,6 @@ def median_ground(path, lod="2.2"):
     tile = load_cityjson(path)
     return np.median([r[:, 2].min() for o in tile.objects.values()
                       for s in o.surfaces(lod, "GroundSurface") for r in s.rings])
-
-
-def pixels_to_ground(A, R, C, uv, ground):
-    """Intersect the rays through pixels uv (N, 2) with the plane Z = ground -> (N, 3)."""
-    rays = R @ np.linalg.solve(A, np.column_stack([uv, np.ones(len(uv))]).T)   # 3 x N, world
-    if C[2] <= ground or np.any(rays[2] >= 0):
-        raise ValueError("ray does not hit the ground plane; check ground z / conventions")
-    s = (ground - C[2]) / rays[2]                     # ray length to reach the plane
-    return C + (rays * s).T
-
-
-def world_to_pixels(X, C, R, f, pp):
-    """Project world points X (N, 3) into the image -> (N, 2) pixels."""
-    Xc = (X - C) @ R                                  # == (R.T @ (X - C).T).T, camera frame
-    return pp + f * Xc[:, :2] / Xc[:, 2:3]
-
-
-def image_name(external_xml):
-    """MicMac 'Orientation-<image>.xml' -> '<image>'."""
-    name = os.path.basename(external_xml)
-    name = name.removeprefix("Orientation-")
-    return name.removesuffix(".xml")
-
-
-def expand_externals(paths):
-    """Files are kept as is; a directory expands to its Orientation-*.xml files."""
-    out = []
-    for p in map(os.path.expanduser, paths):
-        if os.path.isdir(p):
-            out += sorted(glob.glob(os.path.join(p, "Orientation-*.xml")))
-        else:
-            out.append(p)
-    if not out:
-        raise SystemExit(f"no external orientation files found in {paths}")
-    return out
 
 
 def footprints(internal_xml, external_xmls, footprint_csv, centre_csv, names=None):

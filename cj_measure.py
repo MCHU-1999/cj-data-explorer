@@ -234,35 +234,48 @@ def _empty_grid(tile: CityJSON, res: float) -> Raster:
                   transform=Affine(res, 0, xmin, 0, -res, ymax), crs=_epsg(tile.crs))
 
 
-def cityjson_to_dsm(tile: CityJSON, like: Raster | None = None, res: float = 0.5,
-                    lod: str = "2.2", semantic: str = "RoofSurface",
-                    keep_like: bool = False) -> Raster:
-    """Burn the roof surfaces of a CityJSON into a DSM.
+def grid_like(path: str | Path, res: float) -> Raster:
+    """Empty (NaN) grid with the extent, origin and crs of a GeoTIFF, but pixel size `res`.
 
-    Each roof surface is planar, so its height at a pixel centre is taken from the
-    plane fitted through its exterior ring. Where surfaces overlap the highest wins.
-    If `like` is given, its grid (transform, shape, crs) is used so the result can be
-    diffed pixel by pixel; otherwise a grid of size `res` covering the tile is made.
-    If `keep_like` is True (requires `like`), pixels not covered by any surface keep
-    `like`'s values; covered pixels are always overwritten by the CityJSON, even
-    where `like` is higher. Otherwise they are NaN.
+    Only the header is read. The origin (top-left corner) is kept so the grid stays
+    aligned with the source; the extent is rounded outward to whole `res` pixels.
     """
-    if keep_like and like is None:
-        raise ValueError("keep_like=True requires `like`")
-    if like is not None:
-        out = Raster(np.full(like.shape, np.nan, np.float32), like.transform, like.crs)
-    else:
-        out = _empty_grid(tile, res)
-    t, (nrows, ncols) = out.transform, out.shape
-    inv = ~t
+    with rasterio.open(path) as src:
+        t, (h, w), crs = src.transform, src.shape, src.crs
+    shape = (int(np.ceil(h * abs(t.e) / res - 1e-9)), int(np.ceil(w * t.a / res - 1e-9)))
+    return Raster(data=np.full(shape, np.nan, np.float32),
+                  transform=Affine(res, 0, t.c, 0, -res, t.f), crs=crs)
 
+
+@dataclass
+class _Burn:
+    """One surface rasterised on a grid (see _burn_surfaces)."""
+    obj: CityObject
+    index: int                      # index of the surface in obj.surfaces(lod, semantic)
+    surface: Surface
+    normal: np.ndarray              # unit normal of the fitted plane, n_z > 0
+    centroid: np.ndarray            # a point on the plane
+    rows: slice                     # window into the full grid
+    cols: slice
+    mask: np.ndarray                # (rows, cols) bool, pixel centre inside the surface
+    z: np.ndarray                   # (rows, cols) plane height at the pixel centres
+
+
+def _burn_surfaces(tile: CityJSON, grid: Raster, lod: str, semantic: str | None):
+    """Yield every non-vertical surface rasterised on `grid` (north-up), with its plane
+    height at the pixel centres. Each surface is planar, so the height is taken from the
+    plane fitted through its exterior ring. Surfaces outside the grid are skipped."""
+    t, (nrows, ncols) = grid.transform, grid.shape
+    inv = ~t
     for obj in tile.objects.values():
-        for surface in obj.surfaces(lod, semantic):
+        for index, surface in enumerate(obj.surfaces(lod, semantic)):
             exterior = surface.rings[0]
             centroid = exterior.mean(axis=0)    # mean vertex: a point on the fitted plane
             normal = np.linalg.svd(exterior - centroid)[2][-1]
             if abs(normal[2]) < 1e-6:           # vertical: invisible from above
                 continue
+            if normal[2] < 0:
+                normal = -normal
 
             # Pixel window covering the surface's bbox, clipped to the grid.
             # North-up grid, so (xmin, ymax) is the top-left pixel and (xmax, ymin) the bottom-right.
@@ -301,9 +314,64 @@ def cityjson_to_dsm(tile: CityJSON, like: Raster | None = None, res: float = 0.5
             dx, dy = xs[None, :] - centroid[0], ys[:, None] - centroid[1]
             z = centroid[2] - (normal[0] * dx + normal[1] * dy) / normal[2]
 
-            # `window` is a view into out.data; fmax skips NaN, so the highest surface wins
-            window = out.data[row0:row1, col0:col1]
-            window[mask] = np.fmax(window[mask], z[mask])
+            yield _Burn(obj, index, surface, normal, centroid,
+                        slice(row0, row1), slice(col0, col1), mask, z)
+
+
+@dataclass
+class Facet:
+    building_id: str                # the Building (parent of the BuildingPart, if any)
+    object_id: str                  # the CityObject holding the surface
+    index: int                      # index in object.surfaces(lod, semantic)
+    surface: Surface
+    normal: np.ndarray              # unit normal, n_z > 0
+
+
+def roof_facets(tile: CityJSON, grid: Raster, lod: str = "2.2",
+                semantic: str = "RoofSurface") -> tuple[Raster, np.ndarray, list[Facet]]:
+    """Rasterise the facets of one semantic class on `grid`.
+
+    Returns the z raster (NaN off facets), an int32 array of facet ids (-1 off facets;
+    where facets overlap the highest wins, as in cityjson_to_dsm) and the facet table,
+    indexed by facet id.
+    """
+    z = np.full(grid.shape, np.nan, np.float32)
+    ids = np.full(grid.shape, -1, np.int32)
+    facets: list[Facet] = []
+    for b in _burn_surfaces(tile, grid, lod, semantic):
+        fid = len(facets)
+        facets.append(Facet(b.obj.parents[0] if b.obj.parents else b.obj.id, b.obj.id,
+                            b.index, b.surface, b.normal))
+        zw, iw = z[b.rows, b.cols], ids[b.rows, b.cols]
+        win = b.mask & ~(zw >= b.z)             # NaN compares False: empty cells are taken
+        zw[win], iw[win] = b.z[win], fid
+    return Raster(z, grid.transform, grid.crs), ids, facets
+
+
+def cityjson_to_dsm(tile: CityJSON, like: Raster | None = None, res: float = 0.5,
+                    lod: str = "2.2", semantic: str = "RoofSurface",
+                    keep_like: bool = False) -> Raster:
+    """Burn the roof surfaces of a CityJSON into a DSM.
+
+    Each roof surface is planar, so its height at a pixel centre is taken from the
+    plane fitted through its exterior ring. Where surfaces overlap the highest wins.
+    If `like` is given, its grid (transform, shape, crs) is used so the result can be
+    diffed pixel by pixel; otherwise a grid of size `res` covering the tile is made.
+    If `keep_like` is True (requires `like`), pixels not covered by any surface keep
+    `like`'s values; covered pixels are always overwritten by the CityJSON, even
+    where `like` is higher. Otherwise they are NaN.
+    """
+    if keep_like and like is None:
+        raise ValueError("keep_like=True requires `like`")
+    if like is not None:
+        out = Raster(np.full(like.shape, np.nan, np.float32), like.transform, like.crs)
+    else:
+        out = _empty_grid(tile, res)
+
+    for b in _burn_surfaces(tile, out, lod, semantic):
+        # `window` is a view into out.data; fmax skips NaN, so the highest surface wins
+        window = out.data[b.rows, b.cols]
+        window[b.mask] = np.fmax(window[b.mask], b.z[b.mask])
 
     if keep_like and like is not None:
         # Filled after burning (not used as the starting grid) so that fmax above

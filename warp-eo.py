@@ -10,15 +10,15 @@ Each image <name>.tif is matched with Orientation-<name>.tif.xml in the external
 orientation directory and written to <output-dir>/<name>_warped.tif.
 """
 import argparse
-import glob
 import os
 
 import numpy as np
 from osgeo import gdal
 
-from footprint import (CITYJSON, EXTERNAL_XML, IMAGE, INTERNAL_XML, T1_EXTERNAL, T1_INPUT_DIR,
-                       T1_INTERNAL, T1_OUTPUT_DIR, TEST_T1_DIR,
-                       load_external_param, load_internal_param, median_ground, pixels_to_ground)
+from camera import (CITYJSON, EXTERNAL_XML, IMAGE, INTERNAL_XML, T1_EXTERNAL, T1_INPUT_DIR,
+                    T1_INTERNAL, T1_OUTPUT_DIR, TEST_T1_DIR, list_images, load_external_param,
+                    load_internal_param, pixels_to_ground)
+from footprint import median_ground
 
 gdal.UseExceptions()
 
@@ -47,19 +47,6 @@ def warp(image, internal_xml, external_xml, out, ground, res=RES):
               creationOptions=["TILED=YES", "COMPRESS=DEFLATE", "BIGTIFF=IF_SAFER"])
     gdal.Open(out, gdal.GA_Update).BuildOverviews("AVERAGE", [2, 4, 8, 16, 32])
     print(f"  wrote {out}")
-
-
-def list_images(paths):
-    """Files are kept as is; a directory expands to the *.tif files directly inside it."""
-    out = []
-    for p in map(os.path.expanduser, paths):
-        if os.path.isdir(p):
-            out += sorted(glob.glob(os.path.join(p, "*.tif")))
-        else:
-            out.append(p)
-    if not out:
-        raise SystemExit(f"no .tif images found in {paths}")
-    return out
 
 
 def main():

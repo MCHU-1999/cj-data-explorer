@@ -6,7 +6,7 @@ every surface is output, hidden or not. Same mapping as warp-eo.py, so the resul
 oriented_warped.tif in QGIS.
   projected.gpkg   layers roof and ground, one MultiPolygon per building
 
-Camera conventions: see footprint.py.
+Camera conventions: see camera.py.
 """
 import os
 
@@ -14,8 +14,9 @@ import numpy as np
 from osgeo import ogr, osr
 
 from cj_measure import CityJSON, load_cityjson
-from footprint import (TEST_T1_DIR, CITYJSON, EXTERNAL_XML, INTERNAL_XML, load_external_param,
-                       load_internal_param, median_ground, pixels_to_ground, world_to_pixels)
+from camera import (CITYJSON, EXTERNAL_XML, INTERNAL_XML, TEST_T1_DIR, load_external_param,
+                    load_internal_param, pixels_to_ground, world_to_pixels)
+from footprint import median_ground
 
 ogr.UseExceptions()
 
