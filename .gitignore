@@ -3,8 +3,10 @@
 .vscode/
 __pycache__/
 
-
 .DS_Store
+
+# C++ build artifacts
+build/
 
 *.laz
 CiteDescartes/
@@ -19,6 +21,8 @@ data_diff/
 
 
 download_*.py
+
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
