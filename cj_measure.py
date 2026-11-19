@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import rasterio
@@ -41,6 +42,19 @@ class CityObject:
     parents: list[str]
     children: list[str]
     geometries: dict[str, list[Surface]]  # LoD (as string, e.g. "2.2") -> surfaces
+
+    def __str__(self) -> str:
+        return f"CityObject {self.id} ({self.type})"
+
+    def __repr__(self) -> str:
+        return f"CityObject {self.id} ({self.type})"
+
+    def tree(self, tile: CityJSON, depth: int = 0) -> str:
+        """Indented tree of this object and its children."""
+        out = "  " * depth + f"{self.id} ({self.type})\n"
+        for c in self.children:
+            out += tile.objects[c].tree(tile, depth + 1)
+        return out
 
     def surfaces(self, lod: str, semantic: str | None = None) -> list[Surface]:
         """All surfaces at one LoD, optionally filtered by semantic type."""
@@ -78,6 +92,29 @@ class CityJSON:
     def parts(self, building_id: str) -> list[CityObject]:
         """Children of a building. In the 3D BAG the geometry lives in BuildingParts."""
         return [self.objects[c] for c in self.objects[building_id].children]
+
+    def query_buildings(self, pred: Callable[[CityObject], bool]) -> CityJSON:
+        """New CityJSON with only the buildings where pred(building) is True (plus their
+        descendants), e.g. cj.query_buildings(lambda b: len(cj.parts(b.id)) > 1).
+        Vertices are shared as-is, so unreferenced ones remain."""
+        keep: set[str] = set()
+        stack = [b.id for b in self.buildings() if pred(b)]
+        while stack:
+            oid = stack.pop()
+            if oid not in keep:
+                keep.add(oid)
+                stack.extend(self.objects[oid].children)
+        return replace(self, objects={k: v for k, v in self.objects.items() if k in keep},
+                       extent=None)
+
+    def save(self, out_path: str | Path) -> Path:
+        """Write this CityJSON: the source file, restricted to the objects in self.objects."""
+        raw = json.loads(self.path.read_text())
+        raw["CityObjects"] = {k: v for k, v in raw["CityObjects"].items() if k in self.objects}
+        raw.get("metadata", {}).pop("geographicalExtent", None)  # may no longer be accurate
+        out_path = Path(out_path)
+        out_path.write_text(json.dumps(raw, separators=(",", ":")))
+        return out_path
 
     def local_origin(self) -> np.ndarray:
         """Offset to subtract before rendering (avoids float32 precision loss)."""
@@ -453,7 +490,7 @@ if __name__ == "__main__":
     CITYJSON_PATH = Path("data_t0/toulouse.city.json")
     DSM_T0 = Path("data_t0/DSM.tif")
     DSM_T1 = Path("data_t1/DSM-cropped.tif")
-    DSM_DIFF = Path("data_diff/DSM-diff.tif")
+    DSM_DIFF = Path("data_diff/DSM-diff-new.tif")
     DSM_CJ = Path("data_t0/DSM-cityjson.tif")
     ORTHO_T1 = Path("/home/MCHu//Documents/projects/Toulouse_EO/results/Ortho.tif")
     GEOID = Path("data_t0/fr_ign_RAF20.tif")
@@ -463,6 +500,11 @@ if __name__ == "__main__":
     print(f"Loaded file {CITYJSON_PATH}")
     print(f"  - {len(tile.objects)} city objects, {len(tile.vertices)} vertices")
 
+
+    multi = tile.query_buildings(lambda b: len(tile.parts(b.id)) > 1)
+    multi.save("data_t0/multi.city.json")
+
+
     # dsm_1 = load_dsm(DSM_T1)
     # print(f"Loaded file {DSM_T1}")
     # print(f"  - CRS: {dsm_1.crs}")
@@ -471,7 +513,7 @@ if __name__ == "__main__":
     # print(f"Loaded file {DSM_T0}")
     # print(f"  - CRS: {dsm_0.crs}")
 
-    clip_to_bounds(ORTHO_T1, "data_t1/Ortho-cropped.tif", tile.bounds(), bounds_crs=tile.crs, pad=0.5)
+    # clip_to_bounds("/home/MCHu//Documents/projects/Toulouse_EO/results/_DSM_IGN69.tif", "data_t1/_DSM-cropped.tif", tile.bounds(), bounds_crs=tile.crs, pad=0.5)
 
     # cj_dsm = cityjson_to_dsm(tile, like=dsm_0, res=0.1, lod="2.2", semantic="RoofSurface", keep_like=True)
     # cj_dsm.save(DSM_CJ)
